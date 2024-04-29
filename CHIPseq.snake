@@ -1,0 +1,322 @@
+import pandas
+
+sample_csv = pandas.read_csv('sample_sheet.csv', index_col='name')
+CONDITIONS = set(sample_csv['condition'].tolist())
+REPS = set(sample_csv['replicate'].tolist())
+
+
+rule all:
+	input: 
+		expand('results/{condition}_{rep}_fastqc.html', condition = CONDITIONS, rep = REPS),
+		expand('results/plot_{rep}.png', rep = REPS),
+		"results/annotated_peaks.txt",
+		"results/motifs/",
+		'results/multiqc_report.html',
+		'results/correlation_heatmap.png'
+
+# Get files
+rule wget_files:
+	output:
+		'samples/{condition}_{rep}.fastq.gz'
+	params:
+		link = lambda wildcards: sample_csv.loc['{}_{}'.format(wildcards.condition, wildcards.rep), 'ftp_link'],
+		renamed = lambda wildcards: 'samples/{}_{}.fastq.gz'.format(wildcards.condition, wildcards.rep)
+	shell:
+		'''
+		wget -O {params.renamed} {params.link} 
+		'''
+
+# Build bowtie index
+rule bowtie2_build_gencode:
+	input: 
+		'results/GRCh38.primary_assembly.genome.fa.gz'
+	output:
+		'results/index/'
+	threads: 16
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		bowtie2-build {input} {output}
+		'''
+
+# Pre-alignment quality control
+rule fastqc:
+	input:
+		samples = 'samples/{condition}_{rep}.fastq.gz'
+	output:
+		fastqc = 'results/{condition}_{rep}_fastqc.html'
+	params:
+	threads: 4
+	conda:
+		'envs/fastqc_env.yml'
+	shell:
+		'''
+		fastqc {input.samples}
+		'''
+
+#Trim reads
+rule trimomatic:
+	input:
+		samples = 'samples/{condition}_{rep}.fastq.gz',
+		adapter = "TruSeq3-SE.fa"
+	output:
+		trim = 'results/{condition}_{rep}_trimmed.fastq.gz'
+	threads: 8
+	conda:
+		'envs/trimmomatic_env.yml'
+	shell:
+		'''
+		trimmomatic SE {input.samples} {output.trim} ILLUMINACLIP:{input.adapter}:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+		'''
+
+# Alignment
+rule bowtie2_align:
+	input:
+		trim = 'results/{CONDITIONS}_{REPS}_trimmed.fastq.gz'
+	output: 
+		bam = 'results/{CONDITIONS}_{REPS}_Aligned.out.bam'
+	threads: 16
+	params:
+		'results/index/GRCh38'
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		bowtie2 -x {params} -U {input.trim} | samtools view -bS > {output.bam}
+		'''
+
+# Sort and index for downstream usage
+rule samtools_sort:
+	input: 
+		bam = 'results/{CONDITIONS}_{REPS}_Aligned.out.bam'
+	output:
+		sorted = 'results/{CONDITIONS}_{REPS}_sorted.bam'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools sort {input.bam} -o {output.sorted}
+		'''
+
+rule samtools_idx:
+	input:
+		'results/{CONDITIONS}_{REPS}_sorted.bam'
+	output:
+		index_bam = 'results/{CONDITIONS}_{REPS}_sorted.bam.bai'
+	conda:
+		'envs/samtools_env.yml'
+	shell: 
+		'''
+		samtools index {input} 
+		'''
+
+# Post-alignment quality control
+rule samtools_flagstat:
+	input:
+		'results/{CONDITIONS}_{REPS}_sorted.bam'
+	output:
+		flagstats = 'results/{CONDITIONS}_{REPS}_flagstat.txt'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools flagstat {input} > {output.flagstats}
+		'''
+
+rule multiqc:
+	input:
+		flagstat = expand('results/{conditions}_{rep}_flagstat.txt', conditions = CONDITIONS, rep = REPS)
+	output:
+		multiqc = 'results/multiqc_report.html'
+	conda:
+		'envs/multiqc_env.yml'
+	shell:
+		'''
+		multiqc . -o results/
+		'''
+
+
+rule bamCoverage:
+	input: 
+		bam = 'results/{CONDITIONS}_{REPS}_sorted.bam',
+		bam_index = 'results/{CONDITIONS}_{REPS}_sorted.bam.bai'
+	output:
+		bigwig = 'results/{CONDITIONS}_{REPS}.bw'
+	threads: 4
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		bamCoverage -b {input.bam} -o {output.bigwig}
+		'''
+
+# Convert to bigwig format for analysis and vizualization in deeptools
+rule multiBwSummary:
+	input: 
+		bigwig = expand('results/{conditions}_{rep}.bw', conditions = CONDITIONS, rep=REPS)
+	output:
+		correlation_matrix = 'results/correlation_matrix.npz'
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		multiBigwigSummary bins -b {input.bigwig} -o {output.correlation_matrix}
+		'''
+
+# Pearson correlation visualization
+rule plotCorrelation:
+	input:
+		correlation_matrix = 'results/correlation_matrix.npz'
+	output:
+		heatmap = 'results/correlation_heatmap.png'
+	params:
+		plotTitle = "Pearson Correlation Map"
+	conda:
+		'envs/deeptools_env.yml'
+	shell: 
+		'''
+		plotCorrelation -in {input.correlation_matrix} -c pearson -p heatmap -o {output.heatmap}
+		'''
+
+# Find peaks of significant enrichment in alignment localization
+rule make_tag_dir:
+	input:
+		bam = 'results/{CONDITIONS}_{REPS}_sorted.bam',
+	output:
+		tagdirs = directory("results/{CONDITIONS}_{REPS}_tagdir/")
+	params:
+		dirs ="results/{CONDITIONS}_{REPS}_tagdir/"
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+        makeTagDirectory {params.dirs} {input.bam}
+        '''
+
+rule findPeaks:
+	input:
+		bam_runx = "results/RUNX1sample_{REPS}_tagdir/",
+		bam_inp = "results/INPsample_{REPS}_tagdir/"
+	output:
+		 peaks = 'results/peaks_{REPS}.txt'
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+		findPeaks {input.bam_runx} -style factor -o {output} -i {input.bam_inp}
+		'''
+
+rule convertPeakFiles:
+	input:
+		peaks = 'results/peaks_{REPS}.txt'
+	output:
+		beds = 'results/peaks_{REPS}.bed'
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+	 	pos2bed.pl {input.peaks} > {output.beds}
+		'''
+
+rule intersect_peaks:
+	input:
+		bed1 = 'results/peaks_rep1.bed',
+		bed2 = 'results/peaks_rep2.bed'
+	output:
+		merged = "results/merged_peaks.bed"
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -a {input.bed1} -b {input.bed2} -r > {output.merged}
+		'''
+
+rule filter_blacklist:
+	input:
+		merged = "results/merged_peaks.bed",
+		blacklist = "hg38-blacklist.v2.bed"
+	output:
+		filtered_peaks = "results/filtered_peaks.bed"
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -v -a {input.merged} -b {input.blacklist} > {output.filtered_peaks}
+		'''
+
+rule unzip_gtf:
+	input:
+		'gencode.v45.primary_assembly.annotation.gtf.gz'
+	output:
+		'gencode.v45.primary_assembly.annotation.gtf'
+	shell:
+		'''
+		gunzip -c {input} > {output}
+		'''
+
+# Annotate peaks to nearest genomic feature in reference genome
+rule annotate_peaks:
+	input:
+		filtered_peaks = "results/filtered_peaks.bed",
+		gtf = 'gencode.v45.primary_assembly.annotation.gtf'
+	output:
+		annotated_peaks = "results/annotated_peaks.txt"
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+		annotatePeaks.pl {input.filtered_peaks} hg38 -gtf {input.gtf} > {output.annotated_peaks}
+		'''
+
+rule unzip_genome:
+	input:
+		'GRCh38.primary_assembly.genome.fa.gz'
+	output:
+		'GRCh38.primary_assembly.genome.fa'
+	shell:
+		'''
+		gunzip -c {input} > {output}
+		'''
+
+# Find motifs
+rule motifs:
+	input:
+		filtered_peaks = "results/filtered_peaks.bed",
+		genome_fasta = 'GRCh38.primary_assembly.genome.fa'
+	output:
+		motifs = "results/motifs/"
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+		findMotifsGenome.pl {input.filtered_peaks} {input.genome_fasta} {output.motifs} -size 200 -mask
+		'''
+
+# Visualization of signal covered across body of all genes in reference genome
+rule computeMatrix:
+	input:
+		bigwig = 'results/RUNX1sample_{rep}.bw',
+		bed = 'results/hg38_genes.bed'
+	output:
+		matrix = 'results/scale_matrix{rep}.gz'
+	params:
+	conda:
+		'envs/deeptools_env.yml'
+	threads: 4
+	shell:
+		'''
+		computeMatrix scale-regions -S {input.bigwig} -R {input.bed} -b 2000 -a 2000 -o {output.matrix}
+		'''
+
+rule plotMatrix:
+	input:
+		matrix = 'results/scale_matrix{rep}.gz'
+	output:
+		plot = 'results/plot_{rep}.png'
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		plotProfile -m {input.matrix} -o {output.plot}
+		'''
