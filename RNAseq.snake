@@ -1,0 +1,184 @@
+NAMES = ['sample names list']
+REPS = ['rep list']
+
+rule all:
+    input:
+        expand('results/{name}_{rep}_fastqc.html', name = NAMES, rep = REPS),
+        'results/multiqc_report.html', 
+        'results/verse_concat_filtered.csv',
+        'results/id2gene.txt'
+
+
+rule h38:
+    output:
+        'results/GRCh38.primary_assembly.genome.fa.gz'
+    params:
+        genome = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz'
+    shell:
+        '''
+        wget -P results {params.genome}
+        '''
+
+rule h38_gtf:
+    output:
+        'results/gencode.v45.primary_assembly.annotation.gtf.gz'
+    params:
+        gtf = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/gencode.v45.primary_assembly.annotation.gtf.gz'
+    shell:
+        '''
+        wget -P results {params.gtf}
+        '''
+
+
+rule unzip_hg38:
+    input:
+        genome = 'results/gencode.v45.primary_assembly.annotation.gtf.gz'
+    output:
+        gtf = 'results/gencode.v45.primary_assembly.annotation.gtf'
+    shell:
+        '''
+        gunzip -c {input.genome} > {output.gtf}
+        '''
+
+rule unzip_gtf:
+    input:
+        zipped = 'results/GRCh38.primary_assembly.genome.fa.gz'
+    output:
+        unzipped = 'results/GRCh38.primary_assembly.genome.fa'
+    shell:
+        '''
+        gunzip -c {input.zipped} > {output.unzipped}
+        '''
+
+# Pre-Alignment Quality Control
+rule fastqc:
+    input:
+        fastq = expand('samples/{name}_{rep}.fastq.gz', name = NAMES, rep = REPS)
+    output:
+        fastqc = '{outdir}/{name}_{rep}_fastqc.html'
+    params:
+        outdir = 'results'
+    threads:
+        4
+    conda:
+        'envs/fastqc_env.yml'
+    shell:
+        '''
+        fastqc {input.fastq} --outdir {params.outdir}
+        '''
+
+# STAR Index Creation
+rule STAR_index:
+    input:
+        fasta = 'results/GRCh38.primary_assembly.genome.fa',
+        gtf = 'results/gencode.v45.primary_assembly.annotation.gtf'
+    output:
+        directory('samples/h38_star')
+    threads: 16
+    conda:
+        'envs/star_env.yml'
+    shell:
+        '''
+        STAR --runMode genomeGenerate --genomeDir {output} --genomeFastaFiles {input.fasta} --sjdbGTFfile {input.gtf}
+        '''
+
+
+rule STAR_align:
+    input:
+        r1 = 'samples/{name}_R1.fastq.gz',
+        r2 = 'samples/{name}_R2.fastq.gz',
+        star_dir = 'samples/h38_star/'
+    output:
+        bam = 'results/{name}.Aligned.out.bam'
+    params:
+        prefix = 'results/{name}.'
+    threads: 16 
+    conda:
+        'envs/star_env.yml'
+    shell:
+        '''
+        STAR --genomeDir {input.star_dir} --readFilesIn {input.r1} {input.r2} --readFilesCommand zcat --outSAMtype BAM Unsorted --outFileNamePrefix {params.prefix} --runThreadN {threads}
+        '''
+
+
+# Post Alignment Quality Control
+rule samtools_flagstat:
+    input:
+        bam = 'results/{name}.Aligned.out.bam'
+    output:
+        flagstats = 'results/{name}_flagstats.txt'
+    threads: 4
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        '''
+        samtools flagstat {input.bam} > {output.flagstats}
+        '''
+
+rule multiqc:
+    input: 
+        expand('results/{name}_flagstats.txt', name = NAMES, rep = REPS)
+    output:
+        'results/multiqc_report.html'
+    params:    
+        outdir = 'results/'
+    conda:
+        'envs/multiqc_env.yml'
+    shell:
+        '''
+        multiqc {params.outdir} -o {params.outdir} -f
+        '''
+
+# Gene Annotation
+rule verse:
+    input:
+        bam = 'results/{name}.Aligned.out.bam',
+        gtf = 'results/gencode.v45.primary_assembly.annotation.gtf'
+    output:
+        exons = 'results/{name}.exon.txt'
+    params:
+        prefix = 'results/{name}'
+    threads: 8
+    conda:
+        'envs/verse_env.yml'
+    shell:
+        '''
+        verse -S -a {input.gtf} -o {params.prefix} {input.bam}
+        '''
+
+# Exon Counts
+rule concat_verse:
+    input:
+        mats = expand('results/{name}.exon.txt', name=NAMES)
+    output:
+        concat ='results/verse_concat.csv'
+    shell:
+        '''
+        python3 concat_df.py -i {input.mats} -o {output.concat}
+        '''
+
+# Filter Out Genes with 0 Counts
+rule filter_cts:
+    input:
+        verse = 'results/verse_concat.csv'
+    output:
+        filtered = 'results/verse_concat_filtered.csv'
+    threads: 
+        4
+    shell:
+        '''
+        python3 filter_cts_mat.py -i {input.verse} -o {output.filtered}
+        '''
+
+# Map to Common Gene IDs
+rule txn_mapping:
+    input:
+        gtf = 'results/gencode.v45.primary_assembly.annotation.gtf'
+    output:
+        mapping = 'results/id2gene.txt'
+    threads: 
+        4
+    shell:
+        '''
+        python3 parse_gtf.py -i {input.gtf} -o {output.mapping}
+        '''
